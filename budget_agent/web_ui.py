@@ -19,6 +19,7 @@ PROFILE_FIELDS = (
     "car_payment_deadline_day",
     "grace_period_days",
 )
+PAY_SCHEDULE_CHOICES = ("weekly", "biweekly", "semimonthly", "monthly")
 
 HTML = """
 <!doctype html>
@@ -61,6 +62,10 @@ HTML = """
       </label>
       <button type="submit">Generate My Plan</button>
     </form>
+    {% if error %}
+      <h2>Input Error</h2>
+      <pre>{{ error }}</pre>
+    {% endif %}
     {% if summary %}
       <h2>Plan Summary</h2>
       <pre>{{ summary }}</pre>
@@ -75,9 +80,11 @@ def _normalize_bills(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         {
             "name": item["name"],
-            "amount": float(item["amount"]),
-            "due_day": int(item["due_day"]),
-            "deadline_day": int(item["deadline_day"]) if item.get("deadline_day") not in (None, "") else None,
+            "amount": _parse_non_negative_float(str(item["amount"]), "Bill amount"),
+            "due_day": _parse_day(str(item["due_day"]), "Bill due day"),
+            "deadline_day": _parse_day(str(item["deadline_day"]), "Bill deadline day")
+            if item.get("deadline_day") not in (None, "")
+            else None,
         }
         for item in raw
     ]
@@ -87,11 +94,33 @@ def _normalize_goals(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         {
             "name": item["name"],
-            "target_amount": float(item["target_amount"]),
-            "target_date": item["target_date"],
+            "target_amount": _parse_non_negative_float(str(item["target_amount"]), "Goal target amount"),
+            "target_date": _validate_target_date(item["target_date"]),
         }
         for item in raw
     ]
+
+
+def _parse_non_negative_float(value: str, field_name: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative.")
+    return parsed
+
+
+def _parse_day(value: str, field_name: str, min_value: int = 1, max_value: int = 31) -> int:
+    parsed = int(value)
+    if parsed < min_value or parsed > max_value:
+        raise ValueError(f"{field_name} must be between {min_value} and {max_value}.")
+    return parsed
+
+
+def _validate_target_date(value: str) -> str:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return value
+    except ValueError as exc:
+        raise ValueError("Target date must use YYYY-MM-DD format.") from exc
 
 
 def create_app(storage: Storage) -> Flask:
@@ -104,6 +133,7 @@ def create_app(storage: Storage) -> Flask:
         previous_goals = storage.get_savings_goals()
 
         summary = ""
+        error = ""
         bills_json = json.dumps(
             [
                 {
@@ -130,71 +160,97 @@ def create_app(storage: Storage) -> Flask:
 
         if request.method == "POST":
             previous_profile = {key: profile.get(key) for key in PROFILE_FIELDS}
-            profile = {
-                "income": float(request.form["income"]),
-                "pay_schedule": request.form["pay_schedule"],
-                "groceries_budget": float(request.form["groceries_budget"]),
-                "pocket_money": float(request.form["pocket_money"]),
-                "car_payment_amount": float(request.form["car_payment_amount"]),
-                "car_payment_due_day": int(request.form["car_payment_due_day"]),
-                "car_payment_deadline_day": int(request.form["car_payment_deadline_day"])
-                if request.form.get("car_payment_deadline_day")
-                else None,
-                "grace_period_days": int(request.form["grace_period_days"]),
-            }
+            profile = {key: request.form.get(key, "") for key in PROFILE_FIELDS}
+            bills_json = request.form.get("bills_json", "[]") or "[]"
+            goals_json = request.form.get("goals_json", "[]") or "[]"
 
-            bills = _normalize_bills(json.loads(request.form.get("bills_json", "[]") or "[]"))
-            goals = _normalize_goals(json.loads(request.form.get("goals_json", "[]") or "[]"))
+            try:
+                pay_schedule = request.form["pay_schedule"].strip().lower()
+                if pay_schedule not in PAY_SCHEDULE_CHOICES:
+                    raise ValueError(
+                        f"Pay schedule must be one of: {', '.join(PAY_SCHEDULE_CHOICES)}."
+                    )
 
-            storage.save_profile(profile)
-            storage.replace_recurring_bills(bills)
-            storage.replace_savings_goals(goals)
+                profile = {
+                    "income": _parse_non_negative_float(request.form["income"], "Income"),
+                    "pay_schedule": pay_schedule,
+                    "groceries_budget": _parse_non_negative_float(
+                        request.form["groceries_budget"], "Groceries budget"
+                    ),
+                    "pocket_money": _parse_non_negative_float(
+                        request.form["pocket_money"], "Pocket money"
+                    ),
+                    "car_payment_amount": _parse_non_negative_float(
+                        request.form["car_payment_amount"], "Car payment amount"
+                    ),
+                    "car_payment_due_day": _parse_day(
+                        request.form["car_payment_due_day"], "Car payment due day"
+                    ),
+                    "car_payment_deadline_day": _parse_day(
+                        request.form["car_payment_deadline_day"], "Car payment deadline day"
+                    )
+                    if request.form.get("car_payment_deadline_day")
+                    else None,
+                    "grace_period_days": _parse_day(
+                        request.form["grace_period_days"], "Grace period days", min_value=0
+                    ),
+                }
 
-            plan = create_budget_plan(profile, bills, goals)
-            changes = {
-                "profile": detect_changes(previous_profile, profile),
-                "bills_changed": [
-                    {
-                        "name": b["name"],
-                        "amount": float(b["amount"]),
-                        "due_day": int(b["due_day"]),
-                        "deadline_day": b.get("deadline_day"),
-                    }
-                    for b in previous_bills
-                ]
-                != bills,
-                "goals_changed": [
-                    {
-                        "name": g["name"],
-                        "target_amount": float(g["target_amount"]),
-                        "target_date": g["target_date"],
-                    }
-                    for g in previous_goals
-                ]
-                != goals,
-            }
-            summary = render_plan_text(plan, changes)
-            storage.save_session(
-                period_label=datetime.now().strftime("%Y-%m"),
-                detected_changes=changes,
-                budget_plan=plan,
-                summary_text=summary,
-                interaction_log=[
-                    {
-                        "role": "assistant",
-                        "message": "Web UI budgeting plan generated",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-                ],
-            )
+                bills = _normalize_bills(json.loads(bills_json))
+                goals = _normalize_goals(json.loads(goals_json))
 
-            bills_json = json.dumps(bills, indent=2)
-            goals_json = json.dumps(goals, indent=2)
+                storage.save_profile(profile)
+                storage.replace_recurring_bills(bills)
+                storage.replace_savings_goals(goals)
+
+                plan = create_budget_plan(profile, bills, goals)
+                changes = {
+                    "profile": detect_changes(previous_profile, profile),
+                    "bills_changed": [
+                        {
+                            "name": b["name"],
+                            "amount": float(b["amount"]),
+                            "due_day": int(b["due_day"]),
+                            "deadline_day": b.get("deadline_day"),
+                        }
+                        for b in previous_bills
+                    ]
+                    != bills,
+                    "goals_changed": [
+                        {
+                            "name": g["name"],
+                            "target_amount": float(g["target_amount"]),
+                            "target_date": g["target_date"],
+                        }
+                        for g in previous_goals
+                    ]
+                    != goals,
+                }
+                summary = render_plan_text(plan, changes)
+                storage.save_session(
+                    period_label=datetime.now().strftime("%Y-%m"),
+                    detected_changes=changes,
+                    budget_plan=plan,
+                    summary_text=summary,
+                    interaction_log=[
+                        {
+                            "role": "assistant",
+                            "message": "Web UI budgeting plan generated",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ],
+                )
+
+                bills_json = json.dumps(bills, indent=2)
+                goals_json = json.dumps(goals, indent=2)
+            except (ValueError, TypeError, json.JSONDecodeError, KeyError) as exc:
+                error = f"Please fix input values: {exc}"
 
         return render_template_string(
             HTML,
             profile=profile,
             summary=summary,
+            error=error,
             bills_json=bills_json,
             goals_json=goals_json,
         )

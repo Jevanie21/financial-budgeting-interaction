@@ -18,6 +18,7 @@ PROFILE_FIELDS = (
     "car_payment_deadline_day",
     "grace_period_days",
 )
+PAY_SCHEDULE_CHOICES = ("weekly", "biweekly", "semimonthly", "monthly")
 
 
 def _normalized_profile(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -41,37 +42,72 @@ class SessionManager:
         while True:
             raw = SessionManager._prompt_text(prompt, str(default) if default is not None else None)
             try:
-                return float(raw)
+                value = float(raw)
+                if value < 0:
+                    print("Please enter a non-negative number.")
+                    continue
+                return value
             except ValueError:
                 print("Please enter a valid number.")
 
     @staticmethod
-    def _prompt_int(prompt: str, default: Optional[int] = None) -> int:
+    def _prompt_int(
+        prompt: str, default: Optional[int] = None, min_value: int = 1, max_value: int = 31
+    ) -> int:
         while True:
             raw = SessionManager._prompt_text(prompt, str(default) if default is not None else None)
             try:
-                return int(raw)
+                value = int(raw)
+                if not min_value <= value <= max_value:
+                    print(f"Please enter a value between {min_value} and {max_value}.")
+                    continue
+                return value
             except ValueError:
                 print("Please enter a valid whole number.")
 
     @staticmethod
-    def _prompt_optional_int(prompt: str, default: Optional[int] = None) -> Optional[int]:
+    def _prompt_optional_int(
+        prompt: str, default: Optional[int] = None, min_value: int = 1, max_value: int = 31
+    ) -> Optional[int]:
         suffix = f" [{default}]" if default is not None else ""
         while True:
             raw = input(f"{prompt}{suffix}: ").strip()
             if raw == "":
                 return default
             try:
-                return int(raw)
+                value = int(raw)
+                if not min_value <= value <= max_value:
+                    print(f"Please enter a value between {min_value} and {max_value}.")
+                    continue
+                return value
             except ValueError:
                 print("Please enter a valid whole number.")
+
+    @staticmethod
+    def _prompt_pay_schedule(default: str = "biweekly") -> str:
+        while True:
+            value = SessionManager._prompt_text(
+                "Pay schedule (weekly/biweekly/semimonthly/monthly)", default
+            ).lower()
+            if value in PAY_SCHEDULE_CHOICES:
+                return value
+            print(f"Please choose one of: {', '.join(PAY_SCHEDULE_CHOICES)}.")
+
+    @staticmethod
+    def _prompt_target_date(default: Optional[str] = None) -> str:
+        while True:
+            value = SessionManager._prompt_text("Target date (YYYY-MM-DD)", default)
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+                return value
+            except ValueError:
+                print("Please enter a date in YYYY-MM-DD format.")
 
     def collect_profile(self, previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {
             "income": self._prompt_float("Income this pay period", previous.get("income") if previous else None),
-            "pay_schedule": self._prompt_text(
-                "Pay schedule (weekly/biweekly/semimonthly/monthly)",
-                previous.get("pay_schedule") if previous else "biweekly",
+            "pay_schedule": self._prompt_pay_schedule(
+                previous.get("pay_schedule") if previous else "biweekly"
             ),
             "groceries_budget": self._prompt_float(
                 "Groceries budget", previous.get("groceries_budget") if previous else None
@@ -91,7 +127,9 @@ class SessionManager:
                 previous.get("car_payment_deadline_day") if previous else None,
             ),
             "grace_period_days": self._prompt_int(
-                "Grace period in days", previous.get("grace_period_days") if previous else 0
+                "Grace period in days (0-31)",
+                previous.get("grace_period_days") if previous else 0,
+                min_value=0,
             ),
         }
 
@@ -148,7 +186,7 @@ class SessionManager:
             if not name:
                 break
             target_amount = self._prompt_float("Target amount")
-            target_date = self._prompt_text("Target date (YYYY-MM-DD)")
+            target_date = self._prompt_target_date()
             goals.append(
                 {"name": name, "target_amount": target_amount, "target_date": target_date}
             )
